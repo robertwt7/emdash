@@ -27,6 +27,8 @@ optional_env:
 
 Cross-platform Electron app that orchestrates multiple CLI coding agents (Claude Code, Codex, Qwen Code, Amp, etc.) in parallel. Each agent runs in its own Git worktree for isolation. Also supports remote development over SSH.
 
+**iOS app**: See `iOS/AGENTS.md` for the native iOS companion app (remote-only, SSH-based agent orchestration).
+
 ### Tech Stack
 
 - **Runtime**: Electron 30.5.1, Node.js >=20.0.0 <23.0.0 (recommended: 22.20.0 via `.nvmrc`)

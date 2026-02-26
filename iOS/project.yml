@@ -1,0 +1,55 @@
+name: Emdash
+options:
+  bundleIdPrefix: com.emdash
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+
+packages:
+  Citadel:
+    url: https://github.com/orlandos-nl/Citadel
+    from: "0.7.0"
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: "1.2.0"
+
+targets:
+  Emdash:
+    type: application
+    platform: iOS
+    sources: [Emdash]
+    resources:
+      - path: Emdash/Resources
+    settings:
+      base:
+        INFOPLIST_FILE: Emdash/Resources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.emdash.ios
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: true
+    dependencies:
+      - package: Citadel
+      - package: SwiftTerm
+
+  EmdashTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [EmdashTests]
+    dependencies:
+      - target: Emdash
+
+schemes:
+  Emdash:
+    build:
+      targets:
+        Emdash: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - EmdashTests
