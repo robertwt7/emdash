@@ -13,9 +13,14 @@ DerivedData/
 .build/
 .swiftpm/
 
-# Misc
-*.hmap
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
 *.xccheckout
+
+# Xcode misc
+*.hmap
 *.moved-aside
 *.pbxuser
 !default.pbxuser
@@ -25,6 +30,18 @@ DerivedData/
 !default.mode2v3
 *.perspectivev3
 !default.perspectivev3
-xcuserdata/
-*.xcscmblueprint
-*.xcuserstate
+
+# OS files
+.DS_Store
+
+# Scratch notes
+.notes/
+
+# CocoaPods (if ever used)
+Pods/
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/

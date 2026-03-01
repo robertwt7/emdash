@@ -15,23 +15,27 @@ struct TerminalView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Terminal output area
+            // Terminal output area — each line is a separate Text in LazyVStack
+            // so SwiftUI only renders visible lines (crucial for large output).
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        Text(viewModel.output)
-                            .font(.system(size: terminalFontSize, design: .monospaced))
-                            .foregroundStyle(.green)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
-                            .id("terminal-bottom")
+                        ForEach(Array(viewModel.lines.enumerated()), id: \.offset) { index, line in
+                            Text(line.isEmpty ? " " : line)
+                                .font(.system(size: terminalFontSize, design: .monospaced))
+                                .foregroundStyle(.green)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 8)
+                                .id(index)
+                        }
                     }
                 }
-                .onChange(of: viewModel.output) {
-                    withAnimation(.easeOut(duration: 0.1)) {
-                        proxy.scrollTo("terminal-bottom", anchor: .bottom)
-                    }
+                .onChange(of: viewModel.lines.count) {
+                    proxy.scrollTo(viewModel.lines.count - 1, anchor: .bottom)
+                }
+                .onChange(of: viewModel.scrollToken) {
+                    proxy.scrollTo(viewModel.lines.count - 1, anchor: .bottom)
                 }
             }
             // Always dark background regardless of system appearance
@@ -108,41 +112,58 @@ private struct TerminalKey: View {
 
 // MARK: - Terminal View Model
 
-/// View model managing terminal output buffer with ChatMessage persistence.
-/// Loads past session output on attach, auto-saves output when sessions end.
+/// View model managing terminal output as an array of lines for lazy rendering.
+/// Loads past session output asynchronously on attach, auto-saves when sessions end.
+/// Batches incoming output on a 50ms timer to avoid excessive SwiftUI re-renders.
 @MainActor
 final class TerminalViewModel: ObservableObject {
-    @Published var output: String = ""
+    /// Lines of terminal output — each line is rendered as a separate Text view
+    /// inside LazyVStack so SwiftUI only measures/renders visible lines.
+    @Published var lines: [String] = [""]
+    /// Toggled to force a scroll when content changes without line count changing.
+    @Published var scrollToken: Bool = false
 
     private var currentPtyId: String?
     private var currentConversationId: String?
     /// Tracks output from the current live session only (for saving).
     private var liveSessionOutput: String = ""
-    private let maxOutputLength = 100_000
+    private let maxLineCount = 10_000
     private weak var appState: AppState?
+
+    /// Pending raw text to flush on next timer tick.
+    private var pendingText: String = ""
+    /// Timer that batches output updates (~50ms) to avoid per-chunk re-renders.
+    private var flushTask: Task<Void, Never>?
+
+    /// Regex for lines that are only box-drawing / separator characters (═─━┈ etc.)
+    private static let separatorLinePattern: NSRegularExpression = {
+        try! NSRegularExpression(pattern: "^[\\s═─━┈┉┅╌╍┄╴╶╸╺│┃┊┋╎╏║╔╗╚╝╠╣╦╩╬├┤┬┴┼]+$")
+    }()
 
     func attach(ptyId: String, conversationId: String, appState: AppState) {
         guard !ptyId.isEmpty else {
-            output = "No agent configured for this conversation.\n"
+            lines = ["No agent configured for this conversation."]
             return
         }
         currentPtyId = ptyId
         currentConversationId = conversationId
         self.appState = appState
-        output = ""
+        lines = [""]
         liveSessionOutput = ""
+        pendingText = ""
 
-        // Load saved terminal history from previous sessions
-        loadHistory(conversationId: conversationId, appState: appState)
+        // Load history asynchronously so navigation is instant
+        Task {
+            await loadHistory(conversationId: conversationId, appState: appState)
+        }
 
         // Get the PTY session with retry — the session may still be initializing
         // when the view appears (race between spawnAgent and onAppear).
         Task {
             let session = await getSessionWithRetry(ptyId: ptyId, appState: appState)
             guard let session else {
-                // No live session — history was already loaded above
-                if output.isEmpty {
-                    output = "No active session for this agent.\n"
+                if lines == [""] {
+                    lines = ["No active session for this agent."]
                 }
                 return
             }
@@ -151,22 +172,89 @@ final class TerminalViewModel: ObservableObject {
                 guard let self else { return }
                 guard let text = String(data: data, encoding: .utf8) else { return }
                 Task { @MainActor in
-                    self.appendOutput(text)
                     self.liveSessionOutput += text
+                    self.scheduleFlush(text)
                 }
             }
 
             session.onExit = { [weak self] in
                 Task { @MainActor in
-                    self?.appendOutput("\n--- Session ended ---\n")
+                    self?.flushPending()
+                    self?.appendLines("\n--- Session ended ---\n")
                     self?.autoSaveOutput()
                 }
             }
         }
     }
 
-    /// Load past ChatMessage records (terminal output + user messages) for this conversation.
-    private func loadHistory(conversationId: String, appState: AppState) {
+    // MARK: - Batched Output
+
+    /// Queue text and start a 50ms flush timer if one isn't running.
+    private func scheduleFlush(_ text: String) {
+        pendingText += text
+        guard flushTask == nil else { return }
+        flushTask = Task {
+            try? await Task.sleep(for: .milliseconds(50))
+            self.flushPending()
+        }
+    }
+
+    /// Flush all pending text into the lines array in one update.
+    private func flushPending() {
+        flushTask?.cancel()
+        flushTask = nil
+        guard !pendingText.isEmpty else { return }
+        let text = pendingText
+        pendingText = ""
+        appendLines(text)
+    }
+
+    /// Append text to the lines array, stripping ANSI codes and collapsing junk.
+    private func appendLines(_ text: String) {
+        // Strip all ANSI escape sequences (cursor movement, colors, erase, etc.)
+        let cleaned = ANSIStripper.strip(text)
+        let newParts = cleaned.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard !newParts.isEmpty else { return }
+
+        // Append first part to the current (last) line
+        lines[lines.count - 1] += newParts[0]
+
+        // Remaining parts are new lines — skip consecutive blank/separator lines
+        if newParts.count > 1 {
+            for part in newParts.dropFirst() {
+                let trimmed = part.trimmingCharacters(in: .whitespaces)
+                let isSeparator = !trimmed.isEmpty && Self.isSeparatorLine(trimmed)
+                let isBlank = trimmed.isEmpty
+
+                // Collapse consecutive blank/separator lines into one blank line
+                if (isBlank || isSeparator), let lastLine = lines.last {
+                    let lastTrimmed = lastLine.trimmingCharacters(in: .whitespaces)
+                    if lastTrimmed.isEmpty {
+                        continue // skip consecutive blank/separator
+                    }
+                }
+                lines.append(isBlank ? "" : (isSeparator ? "" : part))
+            }
+        }
+
+        // Trim if too many lines (keep most recent)
+        if lines.count > maxLineCount {
+            lines.removeFirst(lines.count - maxLineCount)
+        }
+
+        scrollToken.toggle()
+    }
+
+    /// Check if a line consists only of box-drawing / separator characters.
+    private static func isSeparatorLine(_ line: String) -> Bool {
+        let range = NSRange(line.startIndex..., in: line)
+        return separatorLinePattern.firstMatch(in: line, range: range) != nil
+    }
+
+    // MARK: - History
+
+    /// Load past ChatMessage records asynchronously for this conversation.
+    private func loadHistory(conversationId: String, appState: AppState) async {
         guard let context = appState.modelContainer?.mainContext else { return }
 
         let targetId = conversationId
@@ -182,9 +270,6 @@ final class TerminalViewModel: ObservableObject {
 
         guard let messages = try? context.fetch(descriptor), !messages.isEmpty else { return }
 
-        // Interleave terminal output and user messages chronologically.
-        // Terminal output gets a "--- Session ended ---" suffix.
-        // User messages get a "> " prefix to distinguish prompts from output.
         var history = ""
         for message in messages {
             if message.sender == "user" {
@@ -198,10 +283,17 @@ final class TerminalViewModel: ObservableObject {
             }
         }
         history += "\n"
-        output = history
+
+        // Strip ANSI from saved history (old sessions may contain escape codes),
+        // split into lines and assign
+        let cleanHistory = ANSIStripper.strip(history)
+        lines = cleanHistory.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if lines.isEmpty { lines = [""] }
 
         Log.db.debug("Loaded \(messages.count) history message(s) for conversation \(conversationId)")
     }
+
+    // MARK: - Persistence
 
     /// Auto-save current live session output when the session ends.
     private func autoSaveOutput() {
@@ -234,16 +326,16 @@ final class TerminalViewModel: ObservableObject {
         Log.db.debug("Auto-saved terminal output (\(message.content.count) chars) for conversation \(conversationId)")
     }
 
+    // MARK: - Session Lookup
+
     /// Retry session lookup to handle timing between agent spawn and view attach.
     private func getSessionWithRetry(ptyId: String, appState: AppState) async -> RemotePtySession? {
-        // Try immediately
         if let session = await appState.agentManager.getSession(ptyId) {
             return session
         }
-        // Retry after short delays
         for delay in [300, 700, 1500] {
             try? await Task.sleep(for: .milliseconds(delay))
-            guard currentPtyId == ptyId else { return nil } // view changed
+            guard currentPtyId == ptyId else { return nil }
             if let session = await appState.agentManager.getSession(ptyId) {
                 return session
             }
@@ -252,22 +344,13 @@ final class TerminalViewModel: ObservableObject {
     }
 
     func detach() {
-        // Save any unsaved live output before detaching
+        flushPending()
         if !liveSessionOutput.isEmpty {
             autoSaveOutput()
         }
         currentPtyId = nil
         currentConversationId = nil
         appState = nil
-    }
-
-    private func appendOutput(_ text: String) {
-        output += text
-        // Trim if too long (keep most recent content)
-        if output.count > maxOutputLength {
-            let startIndex = output.index(output.endIndex, offsetBy: -maxOutputLength)
-            output = String(output[startIndex...])
-        }
     }
 }
 

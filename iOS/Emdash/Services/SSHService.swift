@@ -200,14 +200,17 @@ actor SSHService {
 
         let session = SSHShellSession(connectionId: connectionId)
 
+        // Use "dumb" terminal type since our UI is a plain Text view that
+        // can't render ANSI escape codes. This tells the remote to skip colors,
+        // cursor positioning, and other VT100 sequences.
         let ptyRequest = SSHChannelRequestEvent.PseudoTerminalRequest(
             wantReply: true,
-            term: "xterm-256color",
+            term: "dumb",
             terminalCharacterWidth: cols,
             terminalRowHeight: rows,
             terminalPixelWidth: 0,
             terminalPixelHeight: 0,
-            terminalModes: .init([])
+            terminalModes: .init([:])
         )
 
         let client = conn.client
@@ -217,22 +220,19 @@ actor SSHService {
                 try await client.withPTY(ptyRequest) { inbound, outbound in
                     // Provide the writer to the session
                     session.setWriter(outbound)
-                    // Start draining output
-                    session.startReading(inbound: inbound)
-                    // Keep the closure alive until cancelled or stream ends
-                    try await withTaskCancellationHandler {
-                        try await Task.sleep(for: .seconds(86400 * 365))
-                    } onCancel: {
-                        Log.pty.debug("PTY closure cancelled for \(connectionId)")
-                    }
+                    // Drain inbound stream — this blocks until the agent exits
+                    // or the connection drops. When it returns, the closure ends
+                    // and the PTY channel closes cleanly.
+                    await session.readUntilEnd(inbound: inbound)
                 }
             } catch is CancellationError {
                 Log.pty.debug("PTY session cancelled for \(connectionId)")
             } catch {
                 Log.pty.error("PTY session error for \(connectionId): \(error.localizedDescription)")
             }
+            // Stream ended or error — notify once
             await MainActor.run {
-                session.onClose?()
+                session.notifyClose()
             }
         }
 
@@ -305,6 +305,8 @@ class SSHShellSession: @unchecked Sendable {
     private var ptyTask: Task<Void, Never>?
     /// Signals that the writer is ready.
     private var writerContinuation: CheckedContinuation<Void, Never>?
+    /// Prevents onClose from firing more than once.
+    private var didClose = false
 
     init(connectionId: String) {
         self.connectionId = connectionId
@@ -334,31 +336,37 @@ class SSHShellSession: @unchecked Sendable {
         }
     }
 
-    /// Start draining the TTYOutput inbound stream and forwarding to onData.
-    func startReading(inbound: TTYOutput) {
-        Task { [weak self] in
-            do {
-                for try await chunk in inbound {
-                    let buf: ByteBuffer
-                    switch chunk {
-                    case .stdout(let b): buf = b
-                    case .stderr(let b): buf = b
-                    }
-                    if let data = buf.getData(at: buf.readerIndex, length: buf.readableBytes),
-                       !data.isEmpty
-                    {
-                        await MainActor.run {
-                            self?.onData?(data)
-                        }
+    /// Drain the TTYOutput inbound stream, forwarding data to onData.
+    /// This method blocks until the stream ends (agent exits or connection drops).
+    /// Called from within the withPTY closure so the closure stays alive while reading.
+    func readUntilEnd(inbound: TTYOutput) async {
+        do {
+            for try await chunk in inbound {
+                let buf: ByteBuffer
+                switch chunk {
+                case .stdout(let b): buf = b
+                case .stderr(let b): buf = b
+                }
+                if let data = buf.getData(at: buf.readerIndex, length: buf.readableBytes),
+                   !data.isEmpty
+                {
+                    await MainActor.run {
+                        self.onData?(data)
                     }
                 }
-            } catch {
-                Log.pty.error("PTY read error: \(error.localizedDescription)")
             }
-            await MainActor.run {
-                self?.onClose?()
-            }
+        } catch is CancellationError {
+            // Session was cancelled (close() called) — expected
+        } catch {
+            Log.pty.error("PTY read error: \(error.localizedDescription)")
         }
+    }
+
+    /// Fire onClose exactly once. Called by the ptyTask after withPTY returns.
+    func notifyClose() {
+        guard !didClose else { return }
+        didClose = true
+        onClose?()
     }
 
     /// Write data to the PTY stdin.

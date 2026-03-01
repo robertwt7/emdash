@@ -170,6 +170,20 @@
 - [x] **Keystroke injection now supported** - TUI agents (Amp, OpenCode) that use `useKeystrokeInjection: true` can now have their prompts typed into the terminal via PTY stdin writes with a 500ms startup delay.
 - [x] **Input bar always enabled while running** - The input bar is no longer disabled during agent execution. Users can type and send messages at any time — input goes directly to the agent's stdin.
 
+#### Terminal Performance & ANSI Cleanup (Phase 2.6)
+
+##### Major
+- [x] **ANSI escape sequence stripping** - Added `ANSIStripper` utility that removes all ANSI escape sequences from terminal output before rendering. Handles CSI sequences (cursor movement `[3A`, erase line `[2K`, colors `[38;5;103m`), OSC sequences (terminal title, hyperlinks), character set selection, and simple escape codes. TUI agents like Gemini CLI emit cursor control sequences even with `TERM=dumb`; these were showing as raw text like `[3A[4G[3B[2K[1A[2K`. Now stripped cleanly.
+- [x] **Line-based lazy rendering** - Replaced the single giant `Text(viewModel.output)` (up to 100K characters in one view) with a `LazyVStack` containing one `Text` per line via `ForEach`. SwiftUI now only measures and renders lines visible on screen. Previously, navigating to a task with long output took several seconds as SwiftUI laid out the entire 100K-character string; now it's near-instant regardless of output length.
+- [x] **Batched output updates (50ms throttle)** - Incoming PTY data chunks are buffered in `pendingText` and flushed to the line array every 50ms instead of triggering a SwiftUI re-render on every tiny data chunk. Dramatically reduces re-render frequency during fast streaming output.
+
+##### Minor
+- [x] **Async history loading** - `loadHistory()` now runs in an async `Task` instead of synchronously during `attach()`. The view appears immediately with an empty terminal, then history populates without blocking navigation.
+- [x] **Box-drawing separator line collapsing** - Lines consisting only of box-drawing characters (`═`, `─`, `━`, `║`, etc.) from TUI agent interfaces are collapsed. Consecutive blank/separator lines are merged into a single blank line, cleaning up the messy repeated TUI redraws.
+- [x] **Triple ANSI defense in RemotePtyService** - Added `export TERM=dumb` to the initial stty command, `export TERM=dumb NO_COLOR=1` after sourcing shell profiles (which can override TERM), and client-side `ANSIStripper.strip()` as a final safety net. `NO_COLOR=1` follows the https://no-color.org standard respected by many modern CLIs.
+- [x] **ANSI stripping for saved history** - Old sessions saved with raw ANSI codes in `ChatMessage` records are now cleaned via `ANSIStripper.strip()` when loaded, so historical output also displays cleanly.
+- [x] **Output cap changed to 10K lines** - Replaced the 100K character cap with a 10K line cap, which is more meaningful for terminal output and works naturally with the line-based rendering approach.
+
 ### TODO - Remaining Features (pick up here)
 
 #### Critical - SSH Integration

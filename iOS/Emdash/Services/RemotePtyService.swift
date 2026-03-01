@@ -98,6 +98,15 @@ actor RemotePtyService {
 
         sessions[options.id] = session
 
+        // Disable echo so our init commands aren't printed back to the terminal,
+        // suppress the shell prompt during setup, and force TERM=dumb so the
+        // remote shell and agent CLIs skip all ANSI escape sequences.
+        // After the agent starts via `exec`, it takes over stdout.
+        try await shellSession.write("stty -echo && PS1='' && PS2='' && export TERM=dumb\n")
+
+        // Small delay to let stty take effect before writing init commands
+        try? await Task.sleep(for: .milliseconds(50))
+
         // Write init commands as stdin lines to the live shell
         let initLines = buildRemoteInitKeystrokes(options: options)
         for line in initLines {
@@ -137,7 +146,9 @@ actor RemotePtyService {
             "/usr/local/bin",                   // homebrew (macOS), manual installs
             "/home/linuxbrew/.linuxbrew/bin",   // homebrew (Linux)
         ].joined(separator: ":")
-        lines.append("export PATH=\"\(extraPaths):$PATH\"; . ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null; . ~/.bash_profile 2>/dev/null")
+        // Source profiles, then re-force TERM=dumb + NO_COLOR after sourcing
+        // (profiles may override TERM). NO_COLOR=1 is the https://no-color.org standard.
+        lines.append("export PATH=\"\(extraPaths):$PATH\"; . ~/.profile 2>/dev/null; . ~/.bashrc 2>/dev/null; . ~/.bash_profile 2>/dev/null; export TERM=dumb NO_COLOR=1")
 
         // Export environment variables
         for (key, value) in options.env {
